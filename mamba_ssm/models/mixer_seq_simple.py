@@ -1,5 +1,8 @@
 # Copyright (c) 2023, Albert Gu, Tri Dao.
 
+# Copyright (c) 2024, Vida Vakilotojar.
+# Adds support for multi-head SSM.
+
 import math
 from functools import partial
 import json

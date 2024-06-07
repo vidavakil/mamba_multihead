@@ -1,5 +1,8 @@
 # Copyright (c) 2023, Tri Dao, Albert Gu.
 
+# Copyright (c) 2024, Vida Vakilotojar.
+# Adds support for multi-head SSM.
+
 import math
 from typing import Optional
 
