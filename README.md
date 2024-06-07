@@ -11,6 +11,13 @@ Mamba is a new state space model architecture showing promising performance on i
 It is based on the line of progress on [structured state space models](https://github.com/state-spaces/s4),
 with an efficient hardware-aware design and implementation in the spirit of [FlashAttention](https://github.com/Dao-AILab/flash-attention).
 
+## About this fork of Mamba 1.0
+
+After Mamba was released and since early Jan 2024, Vida Vakilotojar has done extensive experiments and architectural explorations on the Mamba architecture that she has not published yet, as it is hard to quatifiably assess their impact at scale with limited GPU resources. When [xLSTM: Extended Long Short-Term Memory](https://arxiv.org/abs/2405.04517) was published in May by Maximilian Beck, Sepp Hochreiter, et al., Vida noticed the similarities between the two architectures, and decided to add some of xLSTM features that were missing from Mamba, to Mamba. These included support for multi-head SSMs, associated block-diagonal matrices, pre-convolution V, scalar dt/A gating, and block-diagonal output projections. By the time she was done, while attending a conference one failing test was still bugging her. When she looked up a suspicious line of Mamba's code on GitHub, she relaized Mamba's authors had released Mamba 2.0. Mamba 2.0 adds those same missing features to Mamba, and likely more.
+I decided to release my code, to show it off. It also fixes that persistent bug, and I have send a pull request for its fix.
+
+Please follow the original instructions of Mamba 1.0 below, for installation, etc.
+
 ## Installation
 
 - [Option] `pip install causal-conv1d>=1.2.0`: an efficient implementation of a simple causal Conv1d layer used inside the Mamba block.
