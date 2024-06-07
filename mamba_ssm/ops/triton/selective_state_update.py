@@ -22,7 +22,7 @@ def _selective_scan_update_kernel(
     # Pointers to matrices
     state_ptr, x_ptr, dt_ptr, dt_bias_ptr, A_ptr, B_ptr, C_ptr, D_ptr, z_ptr, out_ptr,
     # Matrix dimensions
-    batch, dim, dstate,
+    batch, dim, dstate, # notice that this dstate is in fact head_d_state
     # Strides
     stride_state_batch, stride_state_dim, stride_state_dstate,
     stride_x_batch, stride_x_dim,
@@ -86,7 +86,7 @@ def _selective_scan_update_kernel(
         z = tl.load(z_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
 
     dB = B[None, :] * dt[:, None]
-    state = state * dA + dB * x[:, None]
+    state = state * dA + dB * x[:, None] # TODO Question: does triton jit do broadcasting if dA is dx1 instead of dxn?
     tl.store(state_ptrs, state, mask=(offs_m[:, None] < dim) & (offs_n[None, :] < dstate))
     out = tl.sum(state * C[None, :], axis=1)
     if HAS_D:
@@ -96,7 +96,8 @@ def _selective_scan_update_kernel(
     tl.store(out_ptrs, out, mask=offs_m < dim)
 
 
-def selective_state_update(state, x, dt, A, B, C, D=None, z=None, dt_bias=None, dt_softplus=False):
+def selective_state_update(state, x, dt, A, B, C, D=None, z=None, dt_bias=None, dt_softplus=False,
+                           n_heads=1):
     """
     Argument:
         state: (batch, dim, dstate)
@@ -111,11 +112,10 @@ def selective_state_update(state, x, dt, A, B, C, D=None, z=None, dt_bias=None, 
     Return:
         out: (batch, dim)
     """
-    batch, dim, dstate = state.shape
+    batch, dim, dstate = state.shape # notice that this dstate is in fact head_d_state
     assert x.shape == (batch, dim)
-    assert dt.shape == x.shape
     assert A.shape == (dim, dstate)
-    assert B.shape == (batch, dstate)
+    assert B.shape == (batch, dstate * n_heads)
     assert C.shape == B.shape
     if D is not None:
         assert D.shape == (dim,)
@@ -126,35 +126,57 @@ def selective_state_update(state, x, dt, A, B, C, D=None, z=None, dt_bias=None, 
     out = torch.empty_like(x)
     grid = lambda META: (triton.cdiv(dim, META['BLOCK_SIZE_M']), batch)
     z_strides = ((z.stride(0), z.stride(1)) if z is not None else (0, 0))
+
     # We don't want autotune since it will overwrite the state
     # We instead tune by hand.
     BLOCK_SIZE_M, num_warps = ((32, 4) if dstate <= 16
-                               else ((16, 4) if dstate <= 32 else
-                                     ((8, 4) if dstate <= 64 else
-                                      ((4, 4) if dstate <= 128 else
-                                       ((4, 8))))))
-    with torch.cuda.device(x.device.index):
-        _selective_scan_update_kernel[grid](
-            state, x, dt, dt_bias, A, B, C, D, z, out,
-            batch, dim, dstate,
-            state.stride(0), state.stride(1), state.stride(2),
-            x.stride(0), x.stride(1),
-            dt.stride(0), dt.stride(1),
-            dt_bias.stride(0) if dt_bias is not None else 0,
-            A.stride(0), A.stride(1),
-            B.stride(0), B.stride(1),
-            C.stride(0), C.stride(1),
-            D.stride(0) if D is not None else 0,
-            z_strides[0], z_strides[1],
-            out.stride(0), out.stride(1),
-            dt_softplus,
-            BLOCK_SIZE_M,
-            num_warps=num_warps,
-        )
+                            else ((16, 4) if dstate <= 32 else
+                                    ((8, 4) if dstate <= 64 else
+                                    ((4, 4) if dstate <= 128 else
+                                    ((4, 8))))))
+    # Have a loop over the heads here, so that each head's data is packed
+    # together and sent to the triton kernel.
+    head_rows = dim // n_heads
+    head_columns = dstate
+    for i in range(n_heads):
+        row_start = i * head_rows
+        row_end = (i + 1) * head_rows
+        column_start = i * head_columns
+        column_end = (i + 1) * head_columns
+
+        # In multi-head mode, state and A are columnar block-diagonal
+        with torch.cuda.device(x.device.index):
+            _selective_scan_update_kernel[grid](
+                state[:, row_start:row_end, :], 
+                x[:, row_start:row_end],
+                dt[:, row_start:row_end],
+                dt_bias[row_start:row_end] if dt_bias is not None else None,
+                A[row_start:row_end, :],
+                B[:, column_start:column_end],
+                C[:, column_start:column_end],
+                D[row_start:row_end] if D is not None else None,
+                z[:, row_start:row_end] if z is not None else None,
+                out[:, row_start:row_end],
+                batch, dim // n_heads, dstate,
+                state.stride(0), state.stride(1), state.stride(2),
+                x.stride(0), x.stride(1),
+                dt.stride(0), dt.stride(1),
+                dt_bias.stride(0) if dt_bias is not None else 0,
+                A.stride(0), A.stride(1),
+                B.stride(0), B.stride(1),
+                C.stride(0), C.stride(1),
+                D.stride(0) if D is not None else 0,
+                z_strides[0], z_strides[1],
+                out.stride(0), out.stride(1),
+                dt_softplus,
+                BLOCK_SIZE_M,
+                num_warps=num_warps,
+            )
     return out
 
 
-def selective_state_update_ref(state, x, dt, A, B, C, D=None, z=None, dt_bias=None, dt_softplus=False):
+def selective_state_update_ref(state, x, dt, A, B, C, D=None, z=None, dt_bias=None, dt_softplus=False,
+                               n_heads=1):
     """
     Argument:
         state: (batch, dim, dstate)
@@ -169,11 +191,10 @@ def selective_state_update_ref(state, x, dt, A, B, C, D=None, z=None, dt_bias=No
     Return:
         out: (batch, dim)
     """
-    batch, dim, dstate = state.shape
+    batch, dim, dstate = state.shape # notice that this dstate is in fact head_d_state
     assert x.shape == (batch, dim)
-    assert dt.shape == x.shape
     assert A.shape == (dim, dstate)
-    assert B.shape == (batch, dstate)
+    assert B.shape == (batch, dstate * n_heads)
     assert C.shape == B.shape
     if D is not None:
         assert D.shape == (dim,)
@@ -184,9 +205,20 @@ def selective_state_update_ref(state, x, dt, A, B, C, D=None, z=None, dt_bias=No
         dt = dt + dt_bias
     dt = F.softplus(dt) if dt_softplus else dt
     dA = torch.exp(rearrange(dt, "b d -> b d 1") * A)  # (batch, dim, dstate)
-    dB = rearrange(dt, "b d -> b d 1") * rearrange(B, "b n -> b 1 n")  # (batch, dim, dstate)
+
+    # For multi-head, make ssm_state block diagonal before multiplying
+    # it with C, because in this case ssm_state is b(h d/h)(n/h), and C is b(h n/h)
+    dB = rearrange(rearrange(dt, "b (h d) -> b h d 1", h=n_heads) * rearrange(B, "b (h n) -> b h 1 n", h=n_heads), 
+                    "b h d n -> b (h d) n", h=n_heads)  # (batch, dim, dstate)
     state.copy_(state * dA + dB * rearrange(x, "b d -> b d 1"))  # (batch, dim, dstate
-    out = torch.einsum("bdn,bn->bd", state.to(C.dtype), C)
+    out = rearrange(
+        torch.einsum("bhdn,bhn->bhd",
+            rearrange(state, "b (h d) n -> b h d n", h=n_heads),
+            rearrange(C, "b (h n) -> b h n", h=n_heads)),
+            "b h d -> b (h d)"
+    )
+
+    # out = torch.einsum("bdn,bn->bd", state.to(C.dtype), C)
     if D is not None:
         out += (x * D).to(out.dtype)
     return (out if z is None else out * F.silu(z)).to(x.dtype)

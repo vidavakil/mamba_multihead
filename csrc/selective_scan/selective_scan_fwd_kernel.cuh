@@ -96,12 +96,24 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
 
     const int batch_id = blockIdx.x;
     const int dim_id = blockIdx.y;
-    const int group_id = dim_id / (params.dim_ngroups_ratio);
+    const int group_id = dim_id / (params.dim_ngroups_ratio); // Vida: this seems to be wrong! Has to be dim_id * kNRows / params.dim_ngroups_ratio, but it works if kNRows=1
+
+    if (params.scalar_dt)
+        assert(kNRows == 1);
+    // TODO: Vida: dim_group_id should be the same as group_id, and B and C should also use group_id
+    // instead of your new logic. In Mamba_innerfn, utilize the Group dimension of B and C for handling
+    // block-diagonal operations on B and C, and also add a G dimension to A and delta and delta_bias
+    // for the same reason!
+    const int dim_group_id = floor(dim_id * kNRows / (params.scalar_dt ? (params.dim / params.n_heads) : 1));
+
+    // if (threadIdx.x == 0 && batch_id == 0 && dim_id % 20 == 0)
+    //     printf("dim_id: %d, dim_group_id: %d\n", dim_id, dim_group_id);
+
     input_t *u = reinterpret_cast<input_t *>(params.u_ptr) + batch_id * params.u_batch_stride
         + dim_id * kNRows * params.u_d_stride;
     input_t *delta = reinterpret_cast<input_t *>(params.delta_ptr) + batch_id * params.delta_batch_stride
-        + dim_id * kNRows * params.delta_d_stride;
-    weight_t *A = reinterpret_cast<weight_t *>(params.A_ptr) + dim_id * kNRows * params.A_d_stride;
+        + dim_group_id * params.delta_d_stride;
+    weight_t *A = reinterpret_cast<weight_t *>(params.A_ptr) + dim_group_id * params.A_d_stride;
     weight_t *B = reinterpret_cast<weight_t *>(params.B_ptr) + dim_id * kNRows * params.B_d_stride;
     input_t *Bvar = reinterpret_cast<input_t *>(params.B_ptr) + batch_id * params.B_batch_stride + group_id * params.B_group_stride;
     weight_t *C = reinterpret_cast<weight_t *>(params.C_ptr) + dim_id * kNRows * params.C_d_stride;
@@ -119,7 +131,7 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
     if (params.delta_bias_ptr != nullptr) {
         #pragma unroll
         for (int r = 0; r < kNRows; ++r) {
-            delta_bias[r] = reinterpret_cast<float *>(params.delta_bias_ptr)[dim_id * kNRows + r];
+            delta_bias[r] = reinterpret_cast<float *>(params.delta_bias_ptr)[dim_group_id + r];
         }
     }
 
@@ -128,6 +140,7 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
     //     smem_bc[state_idx] = B[state_idx * params.B_dstate_stride] * C[state_idx * params.C_dstate_stride];
     // }
 
+    // kNThreads, each processing kNItems of token positions, and for each token, kNRows of ssm_state.
     constexpr int kChunkSize = kNThreads * kNItems;
     for (int chunk = 0; chunk < params.n_chunks; ++chunk) {
         input_t u_vals[kNRows][kNItems], delta_vals_load[kNRows][kNItems];
@@ -141,8 +154,8 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
             if constexpr (!kDirectIO) { __syncthreads(); }
             load_input<Ktraits>(delta + r * params.delta_d_stride, delta_vals_load[r], smem_load, params.seqlen - chunk * kChunkSize);
         }
-        u += kChunkSize;
-        delta += kChunkSize;
+        u += kChunkSize; // * kNRows?
+        delta += kChunkSize; // * kNRows?
 
         float delta_vals[kNRows][kNItems], delta_u_vals[kNRows][kNItems], out_vals[kNRows][kNItems];
         #pragma unroll
@@ -164,7 +177,7 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
             weight_t A_val[kNRows];
             #pragma unroll
             for (int r = 0; r < kNRows; ++r) {
-                A_val[r] = A[state_idx * params.A_dstate_stride + r * params.A_d_stride];
+                A_val[r] = params.scalar_dt ? A[0] : A[state_idx * params.A_dstate_stride + r * params.A_d_stride];
                 // Multiply the real part of A with LOG2E so we can use exp2f instead of expf.
                 constexpr float kLog2e = M_LOG2E;
                 if constexpr (!kIsComplex) {
@@ -178,8 +191,9 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
             // If both B and C vary, this is unused.
             weight_t BC_val[kNRows];
             weight_t B_vals[kNItems], C_vals[kNItems];
+            int BC_head = dim_id * kNRows / (params.dim / params.n_heads);
             if constexpr (kIsVariableB) {
-                load_weight<Ktraits>(Bvar + state_idx * params.B_dstate_stride, B_vals,
+                load_weight<Ktraits>(Bvar + (BC_head * params.dstate + state_idx) * params.B_dstate_stride, B_vals,
                     smem_load_weight, (params.seqlen - chunk * kChunkSize) * (!kIsComplex ? 1 : 2));
                 if constexpr (!kIsVariableC) {
                     #pragma unroll
@@ -190,7 +204,7 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
             }
             if constexpr (kIsVariableC) {
                 auto &smem_load_weight_C = !kIsVariableB ? smem_load_weight : smem_load_weight1;
-                load_weight<Ktraits>(Cvar + state_idx * params.C_dstate_stride, C_vals,
+                load_weight<Ktraits>(Cvar + (BC_head * params.dstate + state_idx) * params.C_dstate_stride, C_vals,
                     smem_load_weight_C, (params.seqlen - chunk * kChunkSize) * (!kIsComplex ? 1 : 2));
                 if constexpr (!kIsVariableB) {
                     #pragma unroll
@@ -202,7 +216,8 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
             if constexpr (!kIsVariableB && !kIsVariableC) {
                 #pragma unroll
                 for (int r = 0; r < kNRows; ++r) {
-                    BC_val[r] = B[state_idx * params.B_dstate_stride + r * params.B_d_stride] * C[state_idx * params.C_dstate_stride + r * params.C_d_stride];
+                    BC_val[r] = B[state_idx * params.B_dstate_stride + r * params.B_d_stride] * 
+                                C[state_idx * params.C_dstate_stride + r * params.C_d_stride];
                 }
             }
 

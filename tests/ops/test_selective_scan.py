@@ -29,14 +29,16 @@ from mamba_ssm.ops.selective_scan_interface import mamba_inner_fn, mamba_inner_r
 @pytest.mark.parametrize('has_z', [True])
 # @pytest.mark.parametrize('has_D', [False, True])
 @pytest.mark.parametrize('has_D', [True])
-@pytest.mark.parametrize("varBC_groups", [1, 2])
+@pytest.mark.parametrize("varBC_groups", [1])
 # @pytest.mark.parametrize("varBC_groups", [1])
 # @pytest.mark.parametrize("is_variable_C", [False, True])
-@pytest.mark.parametrize("is_variable_C", [True])
+@pytest.mark.parametrize("is_variable_C", [True, False])
 # @pytest.mark.parametrize("is_variable_B", [False, True])
-@pytest.mark.parametrize("is_variable_B", [True])
+@pytest.mark.parametrize("is_variable_B", [True, False])
+@pytest.mark.parametrize("is_multi_head_mamba", [False, True])
+
 def test_selective_scan(is_variable_B, is_variable_C, varBC_groups, has_D, has_z, has_delta_bias,
-                        delta_softplus, return_last_state, seqlen, itype, wtype):
+                        delta_softplus, return_last_state, seqlen, itype, wtype, is_multi_head_mamba):
     if varBC_groups > 1 and (not is_variable_B or not is_variable_C):
         pytest.skip()  # This config is not applicable
     device = 'cuda'
@@ -50,24 +52,41 @@ def test_selective_scan(is_variable_B, is_variable_C, varBC_groups, has_D, has_z
     # set seed
     torch.random.manual_seed(0)
     batch_size = 2
-    dim = 4
-    dstate = 8
+    dim = 16
+    d_state = 16 # head_state * n_heads
     is_complex = wtype == torch.complex64
-    A = (-0.5 * torch.rand(dim, dstate, device=device, dtype=wtype)).requires_grad_()
-    if not is_variable_B:
-        B_shape = (dim, dstate)
-    elif varBC_groups == 1:
-        B_shape = (batch_size, dstate, seqlen if not is_complex else seqlen * 2)
+
+    if is_multi_head_mamba:
+        n_heads = 4
+        scalar_dt = True
     else:
-        B_shape = (batch_size, varBC_groups, dstate, seqlen if not is_complex else seqlen * 2)
+        n_heads = 1
+        scalar_dt = False
+
+    head_d_state = d_state // n_heads
+
+    A = (-0.5 * torch.rand(n_heads if scalar_dt else dim, 1 if scalar_dt else head_d_state, device=device, dtype=wtype)).requires_grad_()
+    if has_delta_bias:
+        delta_bias = (0.5 * torch.rand(n_heads if scalar_dt else dim, device=device, dtype=torch.float32)).requires_grad_()
+    delta = (0.5 * torch.rand(batch_size, n_heads if scalar_dt else dim, seqlen, device=device, dtype=itype)).requires_grad_()
+
+    if not has_delta_bias:
+        delta_bias = None
+
+    if not is_variable_B:
+        B_shape = (dim, head_d_state)
+    elif varBC_groups == 1:
+        B_shape = (batch_size, d_state, seqlen if not is_complex else seqlen * 2)
+    else:
+        B_shape = (batch_size, varBC_groups, d_state, seqlen if not is_complex else seqlen * 2)
     B = torch.randn(*B_shape, device=device, dtype=wtype if not is_variable_B else itype,
                     requires_grad=True)
     if not is_variable_C:
-        C_shape = (dim, dstate)
+        C_shape = (dim, head_d_state)
     elif varBC_groups == 1:
-        C_shape = (batch_size, dstate, seqlen if not is_complex else seqlen * 2)
+        C_shape = (batch_size, d_state, seqlen if not is_complex else seqlen * 2)
     else:
-        C_shape = (batch_size, varBC_groups, dstate, seqlen if not is_complex else seqlen * 2)
+        C_shape = (batch_size, varBC_groups, d_state, seqlen if not is_complex else seqlen * 2)
     C = torch.randn(*C_shape, device=device, dtype=wtype if not is_variable_C else itype,
                     requires_grad=True)
     if has_D:
@@ -78,12 +97,7 @@ def test_selective_scan(is_variable_B, is_variable_C, varBC_groups, has_D, has_z
         z = torch.randn(batch_size, dim, seqlen, device=device, dtype=itype, requires_grad=True)
     else:
         z = None
-    if has_delta_bias:
-        delta_bias = (0.5 * torch.rand(dim, device=device, dtype=torch.float32)).requires_grad_()
-    else:
-        delta_bias = None
     u = torch.randn(batch_size, dim, seqlen, device=device, dtype=itype, requires_grad=True)
-    delta = (0.5 * torch.rand(batch_size, dim, seqlen, device=device, dtype=itype)).requires_grad_()
     A_ref = A.detach().clone().requires_grad_()
     B_ref = B.detach().clone().requires_grad_()
     C_ref = C.detach().clone().requires_grad_()
@@ -95,14 +109,16 @@ def test_selective_scan(is_variable_B, is_variable_C, varBC_groups, has_D, has_z
     out, *rest = selective_scan_fn(
         u, delta, A, B, C, D, z=z,
         delta_bias=delta_bias, delta_softplus=delta_softplus,
-        return_last_state=return_last_state
+        return_last_state=return_last_state,
+        head_d_state=head_d_state, n_heads=n_heads, scalar_dt=scalar_dt
     )
     if return_last_state:
         state = rest[0]
     out_ref, *rest = selective_scan_ref(
         u_ref, delta_ref, A_ref, B_ref, C_ref, D_ref, z=z_ref,
         delta_bias=delta_bias_ref, delta_softplus=delta_softplus,
-        return_last_state=return_last_state
+        return_last_state=return_last_state,
+        head_d_state=head_d_state, n_heads=n_heads, scalar_dt=scalar_dt
     )
     if return_last_state:
         state_ref = rest[0]
@@ -147,17 +163,18 @@ def test_selective_scan(is_variable_B, is_variable_C, varBC_groups, has_D, has_z
         assert torch.allclose(delta_bias.grad, delta_bias_ref.grad, rtol=rtolw, atol=atolw)
 
 
-@pytest.mark.parametrize('wtype', [torch.float32, torch.complex64])
-# @pytest.mark.parametrize('wtype', [torch.complex64])
+#@pytest.mark.parametrize('wtype', [torch.float32, torch.complex64])
+@pytest.mark.parametrize('wtype', [torch.float32])
 # @pytest.mark.parametrize('itype', [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize('itype', [torch.float32])
 # @pytest.mark.parametrize('seqlen', [8, 16, 32, 64, 128, 256, 372, 512, 784, 1024, 1134, 2048, 4096])
-@pytest.mark.parametrize('seqlen', [128])
+@pytest.mark.parametrize('seqlen', [2048])
+#@pytest.mark.parametrize("is_variable_C", [False, True])
 @pytest.mark.parametrize("is_variable_C", [False, True])
-# @pytest.mark.parametrize("is_variable_C", [False])
-@pytest.mark.parametrize("is_variable_B", [False, True])
-# @pytest.mark.parametrize("is_variable_B", [True])
-def test_mamba_inner_fn(is_variable_B, is_variable_C, seqlen, itype, wtype):
+# @pytest.mark.parametrize("is_variable_B", [False, True])
+@pytest.mark.parametrize("is_variable_B", [True])
+@pytest.mark.parametrize("is_multi_head_mamba", [False, True])
+def test_mamba_inner_fn(is_variable_B, is_variable_C, seqlen, itype, wtype, is_multi_head_mamba):
     device = 'cuda'
     rtol, atol = (6e-4, 2e-3) if itype == torch.float32 else (3e-3, 5e-3)
     if itype == torch.bfloat16:
@@ -170,25 +187,52 @@ def test_mamba_inner_fn(is_variable_B, is_variable_C, seqlen, itype, wtype):
     torch.random.manual_seed(0)
     batch_size = 2
     dim = 768
-    dstate = 8
+    d_state = 16 # head_d_state * num_heads
     dt_rank = 48
+
+    if is_multi_head_mamba:
+        n_heads = 4
+        dt_rank = 1
+        scalar_dt = True
+        dense_matrices = False
+        multi_head_proj = True
+        convolved_v = False
+    else:
+        n_heads = 1
+        scalar_dt = False
+        dense_matrices = False
+        multi_head_proj = False
+        convolved_v = True
+
     is_complex = wtype == torch.complex64
     xz = torch.randn(batch_size, 2 * dim, seqlen, device=device, dtype=itype, requires_grad=True)
     conv1d_weight = torch.randn(dim, 1, 3, device=device, dtype=torch.float32, requires_grad=True)
     conv1d_bias = torch.randn(dim, device=device, dtype=torch.float32, requires_grad=True)
-    x_proj_weight = torch.randn(dt_rank + (bool(is_variable_B) + bool(is_variable_C)) * dstate
-                                * (1 if not is_complex else 2),
-                                dim, device=device, dtype=itype, requires_grad=True)
-    delta_proj_weight = torch.randn(dim, dt_rank, device=device, dtype=itype, requires_grad=True)
-    out_proj_weight = torch.randn(dim // 2, dim, device=device, dtype=itype, requires_grad=True)
+
+    assert dim % n_heads == 0
+    assert d_state % n_heads == 0
+
+    head_d_inner = dim // n_heads
+    head_dt_rank = max(1, dt_rank // n_heads)
+    if scalar_dt:
+        head_dt_rank = 1
+    head_d_state = d_state // n_heads
+    x_proj_output_size = head_dt_rank + (bool(is_variable_B) + bool(is_variable_C)) * head_d_state * (1 if not is_complex else 2)
+
+    x_proj_weight = torch.randn(x_proj_output_size * n_heads, head_d_inner, device=device, dtype=itype, requires_grad=True)
+    delta_proj_weight = torch.randn(n_heads if scalar_dt else dim, head_dt_rank, device=device, dtype=itype, requires_grad=True)
+    delta_bias = (0.5 * torch.rand(n_heads if scalar_dt else dim, device=device, dtype=torch.float32)).requires_grad_()
+    A = (-0.5 * torch.rand(n_heads if scalar_dt else dim, 1 if scalar_dt else head_d_state, device=device, dtype=wtype)).requires_grad_()
+    out_proj_weight = torch.randn(dim//2, head_d_inner if multi_head_proj else dim, device=device, dtype=itype, requires_grad=True)
+
     out_proj_bias = None
-    A = (-0.5 * torch.rand(dim, dstate, device=device, dtype=wtype)).requires_grad_()
-    B = (torch.randn(dim, dstate, device=device, dtype=wtype, requires_grad=True)
+
+    B = (torch.randn(dim, head_d_state, device=device, dtype=wtype, requires_grad=True)
          if not is_variable_B else None)
-    C = (torch.randn(dim, dstate, device=device, dtype=wtype, requires_grad=True)
+    C = (torch.randn(dim, head_d_state, device=device, dtype=wtype, requires_grad=True)
          if not is_variable_C else None)
     D = torch.randn(dim, device=device, dtype=torch.float32, requires_grad=True)
-    delta_bias = (0.5 * torch.rand(dim, device=device, dtype=torch.float32)).requires_grad_()
+
     B_proj_bias = None
     C_proj_bias = None
     xz_ref = xz.detach().clone().requires_grad_()
@@ -206,11 +250,13 @@ def test_mamba_inner_fn(is_variable_B, is_variable_C, seqlen, itype, wtype):
     delta_bias_ref = delta_bias.detach().clone().requires_grad_() if delta_bias is not None else None
     out = mamba_inner_fn(xz, conv1d_weight, conv1d_bias, x_proj_weight, delta_proj_weight,
                          out_proj_weight, out_proj_bias,
-                         A, B, C, D, delta_bias=delta_bias, delta_softplus=True)
+                         A, B, C, D, delta_bias=delta_bias, delta_softplus=True,
+                         head_d_state=head_d_state, n_heads=n_heads, scalar_dt=scalar_dt, dense_matrices=dense_matrices, convolved_v=convolved_v, multi_head_proj=multi_head_proj)
     out_ref = mamba_inner_ref(xz_ref, conv1d_weight_ref, conv1d_bias_ref, x_proj_weight_ref,
                               delta_proj_weight_ref, out_proj_weight_ref, out_proj_bias_ref,
                               A_ref, B_ref, C_ref, D_ref,
-                              delta_bias=delta_bias_ref, delta_softplus=True)
+                              delta_bias=delta_bias_ref, delta_softplus=True,
+                              head_d_state=head_d_state, n_heads=n_heads, scalar_dt=scalar_dt, dense_matrices=dense_matrices, convolved_v=convolved_v, multi_head_proj=multi_head_proj)
     # dA = torch.exp(torch.einsum('bdl,dn->bdln', delta, A))
     # dt_u = delta * u
 

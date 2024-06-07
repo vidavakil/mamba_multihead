@@ -79,7 +79,9 @@ void set_ssm_params_fwd(SSMParamsBase &params,
                         void* delta_bias_ptr,
                         void* x_ptr,
                         bool has_z,
-                        bool delta_softplus) {
+                        bool delta_softplus,
+                        int  n_heads,
+                        bool scalar_dt) {
 
     // Reset the parameters
     memset(&params, 0, sizeof(params));
@@ -93,6 +95,8 @@ void set_ssm_params_fwd(SSMParamsBase &params,
     params.dim_ngroups_ratio = dim / n_groups;
 
     params.delta_softplus = delta_softplus;
+    params.n_heads = n_heads;
+    params.scalar_dt = scalar_dt;
 
     params.is_variable_B = is_variable_B;
     params.is_variable_C = is_variable_C;
@@ -173,6 +177,8 @@ void set_ssm_params_bwd(SSMParamsBwd &params,
                         void* ddelta_bias_ptr,
                         bool has_z,
                         bool delta_softplus,
+                        int  n_heads,
+                        bool scalar_dt,
                         bool recompute_out_z) {
     // Pass in "dout" instead of "out", we're not gonna use "out" unless we have z
     set_ssm_params_fwd(params, batch, dim, seqlen, dstate, n_groups, n_chunks, is_variable_B, is_variable_C,
@@ -181,7 +187,7 @@ void set_ssm_params_bwd(SSMParamsBwd &params,
                        // If not recompute_out_z, pass dout instead of out_z.
                        // This won't be used by the bwd kernel
                        recompute_out_z ? out_z : dout,
-                       D_ptr, delta_bias_ptr, x_ptr, has_z, delta_softplus);
+                       D_ptr, delta_bias_ptr, x_ptr, has_z, delta_softplus, n_heads, scalar_dt);
     if (!recompute_out_z) { params.out_z_ptr = nullptr; }
 
     // Set the pointers and strides.
@@ -229,7 +235,10 @@ selective_scan_fwd(const at::Tensor &u, const at::Tensor &delta,
                   const c10::optional<at::Tensor> &D_,
                   const c10::optional<at::Tensor> &z_,
                   const c10::optional<at::Tensor> &delta_bias_,
-                  bool delta_softplus) {
+                  bool delta_softplus,
+                  int  n_heads,
+                  int  head_d_state,
+                  bool scalar_dt) {
     auto input_type = u.scalar_type();
     auto weight_type = A.scalar_type();
     TORCH_CHECK(input_type == at::ScalarType::Float || input_type == at::ScalarType::Half || input_type == at::ScalarType::BFloat16);
@@ -256,24 +265,25 @@ selective_scan_fwd(const at::Tensor &u, const at::Tensor &delta,
     const int batch_size = sizes[0];
     const int dim = sizes[1];
     const int seqlen = sizes[2];
-    const int dstate = A.size(1);
+    // const int dstate = A.size(1);
+    const int dstate = head_d_state;
     const int n_groups = is_variable_B ? B.size(1) : 1;
 
     TORCH_CHECK(dstate <= 256, "selective_scan only supports state dimension <= 256");
 
     CHECK_SHAPE(u, batch_size, dim, seqlen);
-    CHECK_SHAPE(delta, batch_size, dim, seqlen);
-    CHECK_SHAPE(A, dim, dstate);
+    CHECK_SHAPE(delta, batch_size, scalar_dt ? n_heads : dim, seqlen);
+    CHECK_SHAPE(A, scalar_dt ? n_heads : dim, scalar_dt ? 1 : dstate);
     if (!is_variable_B) {
         CHECK_SHAPE(B, dim, dstate);
     } else {
-        CHECK_SHAPE(B, batch_size, n_groups, dstate, !is_complex ? seqlen : seqlen * 2);
+        CHECK_SHAPE(B, batch_size, n_groups, dstate * n_heads, !is_complex ? seqlen : seqlen * 2);
         TORCH_CHECK(B.stride(-1) == 1 || B.size(-1) == 1);
     }
     if (!is_variable_C) {
         CHECK_SHAPE(C, dim, dstate);
     } else {
-        CHECK_SHAPE(C, batch_size, n_groups, dstate, !is_complex ? seqlen: seqlen * 2);
+        CHECK_SHAPE(C, batch_size, n_groups, dstate * n_heads, !is_complex ? seqlen: seqlen * 2);
         TORCH_CHECK(C.stride(-1) == 1 || C.size(-1) == 1);
     }
 
@@ -290,7 +300,7 @@ selective_scan_fwd(const at::Tensor &u, const at::Tensor &delta,
         TORCH_CHECK(delta_bias.scalar_type() == at::ScalarType::Float);
         TORCH_CHECK(delta_bias.is_cuda());
         TORCH_CHECK(delta_bias.stride(-1) == 1 || delta_bias.size(-1) == 1);
-        CHECK_SHAPE(delta_bias, dim);
+        CHECK_SHAPE(delta_bias, scalar_dt ? n_heads : dim);
     }
 
     at::Tensor z, out_z;
@@ -308,7 +318,9 @@ selective_scan_fwd(const at::Tensor &u, const at::Tensor &delta,
     // const int n_chunks = (seqlen + 1024 - 1) / 1024;
     // at::Tensor out = torch::empty_like(u);
     // Right now u has BHL layout and delta has HBL layout, and we want out to have HBL layout
-    at::Tensor out = torch::empty_like(delta);
+    at::Tensor out = (!scalar_dt) ? 
+                    torch::empty_like(delta) : 
+                    torch::empty({batch_size, dim, seqlen}, delta.options().dtype(input_type));
     at::Tensor x;
     x = torch::empty({batch_size, dim, n_chunks, dstate * 2}, u.options().dtype(weight_type));
 
@@ -319,7 +331,8 @@ selective_scan_fwd(const at::Tensor &u, const at::Tensor &delta,
                        delta_bias_.has_value() ? delta_bias_.value().data_ptr() : nullptr,
                        x.data_ptr(),
                        has_z,
-                       delta_softplus);
+                       delta_softplus,
+                       n_heads, scalar_dt);
 
     // Otherwise the kernel will be launched from cuda:0 device
     // Cast to char to avoid compiler warning about narrowing
@@ -346,6 +359,9 @@ selective_scan_bwd(const at::Tensor &u, const at::Tensor &delta,
                   const c10::optional<at::Tensor> &out_,
                   c10::optional<at::Tensor> &dz_,
                   bool delta_softplus,
+                  int  n_heads,
+                  int  head_d_state,
+                  bool scalar_dt,
                   bool recompute_out_z) {
     auto input_type = u.scalar_type();
     auto weight_type = A.scalar_type();
@@ -376,24 +392,26 @@ selective_scan_bwd(const at::Tensor &u, const at::Tensor &delta,
     const int batch_size = sizes[0];
     const int dim = sizes[1];
     const int seqlen = sizes[2];
-    const int dstate = A.size(1);
+    // const int dstate = A.size(1);
+    const int dstate = head_d_state;
     const int n_groups = is_variable_B ? B.size(1) : 1;
 
     TORCH_CHECK(dstate <= 256, "selective_scan only supports state dimension <= 256");
 
     CHECK_SHAPE(u, batch_size, dim, seqlen);
-    CHECK_SHAPE(delta, batch_size, dim, seqlen);
-    CHECK_SHAPE(A, dim, dstate);
+    CHECK_SHAPE(delta, batch_size, scalar_dt ? n_heads : dim, seqlen);
+    CHECK_SHAPE(A, scalar_dt ? n_heads : dim, scalar_dt ? 1 : dstate);
+
     if (!is_variable_B) {
         CHECK_SHAPE(B, dim, dstate);
     } else {
-        CHECK_SHAPE(B, batch_size, n_groups, dstate, !is_complex ? seqlen : seqlen * 2);
+        CHECK_SHAPE(B, batch_size, n_groups, dstate * n_heads, !is_complex ? seqlen : seqlen * 2);
         TORCH_CHECK(B.stride(-1) == 1 || B.size(-1) == 1);
     }
     if (!is_variable_C) {
         CHECK_SHAPE(C, dim, dstate);
     } else {
-        CHECK_SHAPE(C, batch_size, n_groups, dstate, !is_complex ? seqlen: seqlen * 2);
+        CHECK_SHAPE(C, batch_size, n_groups, dstate * n_heads, !is_complex ? seqlen: seqlen * 2);
         TORCH_CHECK(C.stride(-1) == 1 || C.size(-1) == 1);
     }
     CHECK_SHAPE(dout, batch_size, dim, seqlen);
@@ -411,7 +429,7 @@ selective_scan_bwd(const at::Tensor &u, const at::Tensor &delta,
         TORCH_CHECK(delta_bias.scalar_type() == at::ScalarType::Float);
         TORCH_CHECK(delta_bias.is_cuda());
         TORCH_CHECK(delta_bias.stride(-1) == 1 || delta_bias.size(-1) == 1);
-        CHECK_SHAPE(delta_bias, dim);
+        CHECK_SHAPE(delta_bias, scalar_dt ? n_heads : dim);
     }
 
     at::Tensor z, out, dz, out_z;
@@ -456,7 +474,7 @@ selective_scan_bwd(const at::Tensor &u, const at::Tensor &delta,
     }
 
     at::Tensor du = torch::empty_like(u);
-    at::Tensor ddelta = torch::empty_like(delta);
+    at::Tensor ddelta = torch::zeros_like(delta);
     at::Tensor dA = torch::zeros_like(A);
     at::Tensor dB = !is_variable_B ? torch::zeros_like(B) : torch::zeros_like(B, B.options().dtype(torch::kFloat32));
     at::Tensor dC = !is_variable_C ? torch::zeros_like(C) : torch::zeros_like(C, C.options().dtype(torch::kFloat32));
@@ -474,7 +492,9 @@ selective_scan_bwd(const at::Tensor &u, const at::Tensor &delta,
                        dout, du, ddelta, dA, dB, dC, dz,
                        D_.has_value() ? dD.data_ptr() : nullptr,
                        delta_bias_.has_value() ? ddelta_bias.data_ptr() : nullptr,
-                       has_z, delta_softplus, recompute_out_z);
+                       has_z, delta_softplus, 
+                       n_heads, scalar_dt, 
+                       recompute_out_z);
 
     // Otherwise the kernel will be launched from cuda:0 device
     // Cast to char to avoid compiler warning about narrowing

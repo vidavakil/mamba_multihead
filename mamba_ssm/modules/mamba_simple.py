@@ -27,11 +27,16 @@ try:
 except ImportError:
     RMSNorm, layer_norm_fn, rms_norm_fn = None, None, None
 
-
 class Mamba(nn.Module):
     def __init__(
         self,
         d_model,
+        n_heads: int=1,
+        scalar_dt: bool=False,
+        dense_matrices: bool=True,
+        convolved_v: bool=True,
+        complementary_b: bool=False, # input = I - forget
+        multi_head_proj: bool=False,
         d_state=16,
         d_conv=4,
         expand=2,
@@ -58,6 +63,12 @@ class Mamba(nn.Module):
         self.dt_rank = math.ceil(self.d_model / 16) if dt_rank == "auto" else dt_rank
         self.use_fast_path = use_fast_path
         self.layer_idx = layer_idx
+        self.n_heads = n_heads
+        self.scalar_dt = scalar_dt
+        self.dense_matrices = dense_matrices
+        self.convolved_v = convolved_v
+        self.complementary_b = complementary_b
+        self.multi_head_proj = multi_head_proj and n_heads > 1
 
         self.in_proj = nn.Linear(self.d_model, self.d_inner * 2, bias=bias, **factory_kwargs)
 
@@ -74,13 +85,32 @@ class Mamba(nn.Module):
         self.activation = "silu"
         self.act = nn.SiLU()
 
+        if self.scalar_dt:
+            assert self.dt_rank == 1
+        assert self.d_inner % self.n_heads == 0
+        assert self.d_state % self.n_heads == 0
+
+        # TODO: check that dimensions are a multiple of
+        self.head_d_inner = self.d_inner // self.n_heads
+        self.head_dt_rank = max(1, self.dt_rank // self.n_heads)
+        if self.scalar_dt:
+            self.head_dt_rank = 1
+        self.head_d_state = self.d_state // self.n_heads
+        self.x_proj_output_size = self.head_d_state * 2 + self.head_dt_rank
+
+        # x_proj is columnar block-diagonal when multi-head
         self.x_proj = nn.Linear(
-            self.d_inner, self.dt_rank + self.d_state * 2, bias=False, **factory_kwargs
+            self.head_d_inner, self.x_proj_output_size * self.n_heads, bias=False, **factory_kwargs
         )
-        self.dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True, **factory_kwargs)
+
+        # dt_proj is columnar block-diagonal when multi-head, even when we have dt_scalar.
+        if not self.scalar_dt:
+            self.dt_proj = nn.Linear(self.head_dt_rank, self.d_inner, bias=True, **factory_kwargs)
+        else:
+            self.dt_proj = nn.Linear(self.head_dt_rank, self.n_heads, bias=True, **factory_kwargs) # 1 x n_heads
 
         # Initialize special dt projection to preserve variance at initialization
-        dt_init_std = self.dt_rank**-0.5 * dt_scale
+        dt_init_std = self.head_dt_rank**-0.5 * dt_scale
         if dt_init == "constant":
             nn.init.constant_(self.dt_proj.weight, dt_init_std)
         elif dt_init == "random":
@@ -88,24 +118,35 @@ class Mamba(nn.Module):
         else:
             raise NotImplementedError
 
+        # SoftPlus(x) = log(1 + exp(x)) is smooth approximation of ReLU
+        # expm1 = SoftPlus Inverse: SoftPlus_Inverse(x) = log(exp(x) - 1).
+        # Inverse of SoftPlus only defined for (0, infinity)
+
         # Initialize dt bias so that F.softplus(dt_bias) is between dt_min and dt_max
         dt = torch.exp(
-            torch.rand(self.d_inner, **factory_kwargs) * (math.log(dt_max) - math.log(dt_min))
+            torch.rand(self.dt_proj.bias.shape[-1], **factory_kwargs) * (math.log(dt_max) - math.log(dt_min))
             + math.log(dt_min)
         ).clamp(min=dt_init_floor)
         # Inverse of softplus: https://github.com/pytorch/pytorch/issues/72759
-        inv_dt = dt + torch.log(-torch.expm1(-dt))
+        inv_dt = dt + torch.log(-torch.expm1(-dt)) # log(1 - exp(-dt))
         with torch.no_grad():
             self.dt_proj.bias.copy_(inv_dt)
         # Our initialization would set all Linear.bias to zero, need to mark this one as _no_reinit
         self.dt_proj.bias._no_reinit = True
 
         # S4D real initialization
-        A = repeat(
-            torch.arange(1, self.d_state + 1, dtype=torch.float32, device=device),
-            "n -> d n",
-            d=self.d_inner,
-        ).contiguous()
+        if not self.scalar_dt:
+            A = repeat(
+                torch.arange(1, self.head_d_state + 1, dtype=torch.float32, device=device),
+                "n -> d n",
+                d=self.d_inner,
+            ).contiguous() # d_inner x head_d_state
+        else:
+            A = repeat(torch.arange(1, 2, dtype=torch.float32, device=device),
+                "n -> d n",
+                d=self.n_heads,
+            ).contiguous()  # n_heads x 1
+
         A_log = torch.log(A)  # Keep A_log in fp32
         self.A_log = nn.Parameter(A_log)
         self.A_log._no_weight_decay = True
@@ -114,7 +155,10 @@ class Mamba(nn.Module):
         self.D = nn.Parameter(torch.ones(self.d_inner, device=device))  # Keep in fp32
         self.D._no_weight_decay = True
 
-        self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
+        if not self.multi_head_proj:
+            self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
+        else:
+            self.out_proj = nn.Linear(self.head_d_inner, self.d_model, bias=bias, **factory_kwargs)
 
     def forward(self, hidden_states, inference_params=None):
         """
@@ -140,7 +184,7 @@ class Mamba(nn.Module):
         if self.in_proj.bias is not None:
             xz = xz + rearrange(self.in_proj.bias.to(dtype=xz.dtype), "d -> d 1")
 
-        A = -torch.exp(self.A_log.float())  # (d_inner, d_state)
+        A = -torch.exp(self.A_log.float())  # (d_inner, head_d_state)
         # In the backward pass we write dx and dz next to each other to avoid torch.cat
         if self.use_fast_path and causal_conv1d_fn is not None and inference_params is None:  # Doesn't support outputting the states
             out = mamba_inner_fn(
@@ -157,9 +201,18 @@ class Mamba(nn.Module):
                 self.D.float(),
                 delta_bias=self.dt_proj.bias.float(),
                 delta_softplus=True,
+                head_d_state=self.head_d_state,
+                n_heads=self.n_heads,
+                scalar_dt=self.scalar_dt,
+                dense_matrices=self.dense_matrices, 
+                convolved_v=self.convolved_v,
+                multi_head_proj=self.multi_head_proj
             )
         else:
             x, z = xz.chunk(2, dim=1)
+
+            if not self.convolved_v:
+                pre_conv_x = x # bdl
             # Compute short convolution
             if conv_state is not None:
                 # If we just take x[:, :, -self.d_conv :], it will error if seqlen < self.d_conv
@@ -179,15 +232,34 @@ class Mamba(nn.Module):
             # We're careful here about the layout, to avoid extra transposes.
             # We want dt to have d as the slowest moving dimension
             # and L as the fastest moving dimension, since those are what the ssm_scan kernel expects.
-            x_dbl = self.x_proj(rearrange(x, "b d l -> (b l) d"))  # (bl d)
-            dt, B, C = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1)
-            dt = self.dt_proj.weight @ dt.t()
-            dt = rearrange(dt, "d (b l) -> b d l", l=seqlen)
-            B = rearrange(B, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
-            C = rearrange(C, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
+
+            # x_proj is columnar block-diagonal
+            x_dbl = torch.einsum("hod,shd->sho",
+                        rearrange(self.x_proj.weight, "(h d_o_h) d -> h d_o_h d", h=self.n_heads),
+                        rearrange(x, "b (h d) l -> (b l) h d", h=self.n_heads)) # (bl h d)
+            dt, B, C = torch.split(x_dbl, [self.head_dt_rank, self.head_d_state, self.head_d_state], dim=-1) # (bl h d)
+
+            # dt_proj is columnar block-diagonal
+            dt = rearrange(
+                    torch.einsum("hod,shd->sho",
+                        rearrange(self.dt_proj.weight, "(h d_o_h) d -> h d_o_h d", h=self.n_heads),
+                        dt), # h d (bl)
+                        "(b l) h d -> b (h d) l", l=seqlen) # b (hd) l
+            B = rearrange(B, "(b l) h dstate -> b (h dstate) l", l=seqlen).contiguous()
+            C = rearrange(C, "(b l) h dstate -> b (h dstate) l", l=seqlen).contiguous()
+
+            if self.scalar_dt and self.dense_matrices:
+                # resize dt/dt_bias/A to the standard size expected
+                dt = repeat(dt, "b h l -> b (h d) l", d=self.head_d_inner)
+                A = repeat(A, "h1 h2 -> (h1 d) (h2 n)", d=self.head_d_inner, n=self.head_d_state)
+                dt_bias = repeat(dt_bias, "h -> (h d)", d=self.head_d_inner)
+
             assert self.activation in ["silu", "swish"]
+            # At this point, dt/B/C have nice dimensions for any head_size.
+            # But x/A/delta_bias have dimensions that have to be carefully rearranged in
+            # subsequent functions
             y = selective_scan_fn(
-                x,
+                x if (self.convolved_v) else pre_conv_x,  # bdl
                 dt,
                 A,
                 B,
@@ -197,12 +269,23 @@ class Mamba(nn.Module):
                 delta_bias=self.dt_proj.bias.float(),
                 delta_softplus=True,
                 return_last_state=ssm_state is not None,
+                head_d_state=self.head_d_state,
+                n_heads=self.n_heads,
+                scalar_dt=self.scalar_dt and not self.dense_matrices
             )
             if ssm_state is not None:
                 y, last_state = y
                 ssm_state.copy_(last_state)
-            y = rearrange(y, "b d l -> b l d")
-            out = self.out_proj(y)
+            if not self.multi_head_proj:
+                y = rearrange(y, "b d l -> b l d")
+                out = self.out_proj(y)
+            else:
+                out = rearrange(torch.einsum("shd,hod->sho",
+                                        rearrange(y, "b (h d) l -> (b l) h d", h=self.n_heads),
+                                        rearrange(self.out_proj.weight, "(h d_o_h) d -> h d_o_h d", h=self.n_heads)), # (bl h d)
+                    "(b l) h d -> b l (h d)", l=seqlen)
+                if self.out_proj.bias is not None:
+                    out = out + self.out_proj.bias
         return out
 
     def step(self, hidden_states, conv_state, ssm_state):
@@ -210,6 +293,9 @@ class Mamba(nn.Module):
         assert hidden_states.shape[1] == 1, "Only support decoding with 1 token at a time for now"
         xz = self.in_proj(hidden_states.squeeze(1))  # (B 2D)
         x, z = xz.chunk(2, dim=-1)  # (B D)
+
+        if not self.convolved_v:
+            pre_conv_x = x # bdl
 
         # Conv step
         if causal_conv1d_update is None:
@@ -228,28 +314,63 @@ class Mamba(nn.Module):
                 self.activation,
             )
 
-        x_db = self.x_proj(x)  # (B dt_rank+2*d_state)
-        dt, B, C = torch.split(x_db, [self.dt_rank, self.d_state, self.d_state], dim=-1)
+        x_db = torch.einsum("hod,bhd->bho",
+                    rearrange(self.x_proj.weight, "(h d_o_h) d -> h d_o_h d", h=self.n_heads),
+                    rearrange(x, "b (h d) -> b h d", h=self.n_heads)) # (b h d)
+
+        dt, B, C = torch.split(x_db, [self.head_dt_rank, self.head_d_state, self.head_d_state], dim=-1) # (b h d)
         # Don't add dt_bias here
-        dt = F.linear(dt, self.dt_proj.weight)  # (B d_inner)
-        A = -torch.exp(self.A_log.float())  # (d_inner, d_state)
+
+        dt = rearrange(torch.einsum("hod,bhd->bho",
+                                rearrange(self.dt_proj.weight, "(h d_o_h) d -> h d_o_h d", h=self.n_heads), dt),
+                        "b h d -> b (h d") # b (h d)
+        B = rearrange(B, "b h d -> b (h d)") # b (h d)
+        C = rearrange(C, "b h d -> b (h d)") # b (h d)
+        A = -torch.exp(self.A_log.float())  # (d_inner, head_d_state)
+
+        if self.scalar_dt:
+            # resize dt/dt_bias/A to the standard size expected
+            dt = repeat(dt, "b h -> b (h d)", d=self.head_d_inner)
+            A = repeat(A, "h1 h2 -> (h1 d) (h2 n)", d=self.head_d_inner, n=self.head_d_state)
+            dt_bias = repeat(dt_bias, "h -> (h d)", d=self.head_d_inner)
 
         # SSM step
         if selective_state_update is None:
             # Discretize A and B
-            dt = F.softplus(dt + self.dt_proj.bias.to(dtype=dt.dtype))
+            dt = F.softplus(dt + self.dt_proj.bias.to(dtype=dt.dtype)) # bd/b(hd)
             dA = torch.exp(torch.einsum("bd,dn->bdn", dt, A))
-            dB = torch.einsum("bd,bn->bdn", dt, B)
-            ssm_state.copy_(ssm_state * dA + rearrange(x, "b d -> b d 1") * dB)
-            y = torch.einsum("bdn,bn->bd", ssm_state.to(dtype), C)
-            y = y + self.D.to(dtype) * x
+            dB = rearrange(torch.einsum('bhd,bhn->bhdn', 
+                                rearrange(dt, "b (h d) -> b h d", h=self.n_heads), 
+                                rearrange(B, "b (h n) -> b h n", h=self.n_heads)), 'b h d n->b (h d) n')
+            ssm_state.copy_(ssm_state * dA + 
+                            rearrange(x if (self.convolved_v) else pre_conv_x, "b d -> b d 1") * dB)
+            # For multi-head, ssm_state is columnar block-diagonal and multiplying
+            # it with C is special, because ssm_state is b(h d/h)(n/h), and C is b(h n/h)
+            y = rearrange(
+                torch.einsum("bhdn,bhn->bhd",
+                    rearrange(ssm_state.to(dtype), "b (h d) n -> b h d n", h=self.n_heads),
+                    rearrange(C, "b (h n) -> b h n", h=self.n_heads)),
+                    "b h d -> b (h d)"
+            )
+            y = y + self.D.to(dtype) * x if (self.convolved_v) else pre_conv_x
             y = y * self.act(z)  # (B D)
         else:
             y = selective_state_update(
-                ssm_state, x, dt, A, B, C, self.D, z=z, dt_bias=self.dt_proj.bias, dt_softplus=True
+                ssm_state, 
+                x if (self.convolved_v) else pre_conv_x, 
+                dt, A, B, C, self.D, z=z, dt_bias=self.dt_proj.bias, dt_softplus=True,
+                n_heads=self.n_heads
             )
 
-        out = self.out_proj(y)
+        if not self.multi_head_proj:
+            out = self.out_proj(y)
+        else:
+            out = rearrange(torch.einsum("bhd,hod->bho",
+                                rearrange(y, "b (h d) -> b h d", h=self.n_heads),
+                                rearrange(self.out_proj.weight, "(h d_o_h) d -> h d_o_h d", h=self.n_heads)), # (bl h d)
+                         "b h d -> b (h d)")
+            if self.out_proj.bias is not None:
+                out = out + self.out_proj.bias
         return out.unsqueeze(1), conv_state, ssm_state
 
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
@@ -261,7 +382,7 @@ class Mamba(nn.Module):
         ssm_dtype = self.dt_proj.weight.dtype if dtype is None else dtype
         # ssm_dtype = torch.float32
         ssm_state = torch.zeros(
-            batch_size, self.d_model * self.expand, self.d_state, device=device, dtype=ssm_dtype
+            batch_size, self.d_model * self.expand, self.head_d_state, device=device, dtype=ssm_dtype
         )
         return conv_state, ssm_state
 
@@ -279,7 +400,7 @@ class Mamba(nn.Module):
             ssm_state = torch.zeros(
                 batch_size,
                 self.d_model * self.expand,
-                self.d_state,
+                self.head_d_state,
                 device=self.dt_proj.weight.device,
                 dtype=self.dt_proj.weight.dtype,
                 # dtype=torch.float32,
@@ -296,7 +417,7 @@ class Mamba(nn.Module):
 
 class Block(nn.Module):
     def __init__(
-        self, dim, mixer_cls, norm_cls=nn.LayerNorm, fused_add_norm=False, residual_in_fp32=False
+        self, dim, mixer_cls, norm_cls=nn.LayerNorm, fused_add_norm=False, residual_in_fp32=False,
     ):
         """
         Simple block wrapping a mixer class with LayerNorm/RMSNorm and residual connection"

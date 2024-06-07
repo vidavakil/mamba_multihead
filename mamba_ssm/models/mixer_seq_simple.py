@@ -4,6 +4,7 @@ import math
 from functools import partial
 import json
 import os
+import ast
 
 from collections import namedtuple
 
@@ -192,6 +193,9 @@ class MambaLMHeadModel(nn.Module, GenerationMixin):
         fused_add_norm = config.fused_add_norm
         pad_vocab_size_multiple = config.pad_vocab_size_multiple
         factory_kwargs = {"device": device, "dtype": dtype}
+
+        if type(ssm_cfg) == str:
+            ssm_cfg = ast.literal_eval(ssm_cfg)
 
         super().__init__()
         if vocab_size % pad_vocab_size_multiple != 0:

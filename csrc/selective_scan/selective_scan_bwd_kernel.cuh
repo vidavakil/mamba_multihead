@@ -111,26 +111,33 @@ void selective_scan_bwd_kernel(SSMParamsBwd params) {
     const int batch_id = blockIdx.x;
     const int dim_id = blockIdx.y;
     const int group_id = dim_id / (params.dim_ngroups_ratio);
+
+    // TODO: Vida: dim_group_id should be the same as group_id, and B and C should also use group_id
+    // instead of your new logic. In Mamba_innerfn, utilize the Group dimension of B and C for handling
+    // block-diagonal operations on B and C, and also add a G dimension to A and delta and delta_bias
+    // for the same reason!
+    const int dim_group_id = dim_id / (params.scalar_dt ? (params.dim / params.n_heads) : 1);
+
     input_t *u = reinterpret_cast<input_t *>(params.u_ptr) + batch_id * params.u_batch_stride
         + dim_id * params.u_d_stride;
     input_t *delta = reinterpret_cast<input_t *>(params.delta_ptr) + batch_id * params.delta_batch_stride
-        + dim_id * params.delta_d_stride;
+        + dim_group_id * params.delta_d_stride;
     input_t *dout = reinterpret_cast<input_t *>(params.dout_ptr) + batch_id * params.dout_batch_stride
         + dim_id * params.dout_d_stride;
-    weight_t *A = reinterpret_cast<weight_t *>(params.A_ptr) + dim_id * params.A_d_stride;
+    weight_t *A = reinterpret_cast<weight_t *>(params.A_ptr) + dim_group_id * params.A_d_stride;
     weight_t *B = reinterpret_cast<weight_t *>(params.B_ptr) + dim_id * params.B_d_stride;
     input_t *Bvar = reinterpret_cast<input_t *>(params.B_ptr) + batch_id * params.B_batch_stride + group_id * params.B_group_stride;
     weight_t *C = reinterpret_cast<weight_t *>(params.C_ptr) + dim_id * params.C_d_stride;
     input_t *Cvar = reinterpret_cast<input_t *>(params.C_ptr) + batch_id * params.C_batch_stride + group_id * params.C_group_stride;
-    weight_t *dA = reinterpret_cast<weight_t *>(params.dA_ptr) + dim_id * params.dA_d_stride;
+    weight_t *dA = reinterpret_cast<weight_t *>(params.dA_ptr) + dim_group_id * params.dA_d_stride;
     weight_t *dB = reinterpret_cast<weight_t *>(params.dB_ptr)
         + (!kIsVariableB ? dim_id * params.dB_d_stride : batch_id * (!kIsComplex ? params.dB_batch_stride : params.dB_batch_stride / 2) + group_id * params.dB_group_stride);
     weight_t *dC = reinterpret_cast<weight_t *>(params.dC_ptr)
         + (!kIsVariableC ? dim_id * params.dC_d_stride : batch_id * (!kIsComplex ? params.dC_batch_stride : params.dC_batch_stride / 2) + group_id * params.dC_group_stride);
     float *dD = params.dD_ptr == nullptr ? nullptr : reinterpret_cast<float *>(params.dD_ptr) + dim_id;
     float D_val = params.D_ptr == nullptr ? 0 : reinterpret_cast<float *>(params.D_ptr)[dim_id];
-    float *ddelta_bias = params.ddelta_bias_ptr == nullptr ? nullptr : reinterpret_cast<float *>(params.ddelta_bias_ptr) + dim_id;
-    float delta_bias = params.delta_bias_ptr == nullptr ? 0 : reinterpret_cast<float *>(params.delta_bias_ptr)[dim_id];
+    float *ddelta_bias = params.ddelta_bias_ptr == nullptr ? nullptr : reinterpret_cast<float *>(params.ddelta_bias_ptr) + dim_group_id;
+    float delta_bias = params.delta_bias_ptr == nullptr ? 0 : reinterpret_cast<float *>(params.delta_bias_ptr)[dim_group_id];
     scan_t *x = params.x_ptr == nullptr
         ? nullptr
         : reinterpret_cast<scan_t *>(params.x_ptr) + (batch_id * params.dim + dim_id) * (params.n_chunks) * params.dstate;
@@ -215,7 +222,7 @@ void selective_scan_bwd_kernel(SSMParamsBwd params) {
         float ddelta_vals[kNItems] = {0};
         __syncthreads();
         for (int state_idx = 0; state_idx < params.dstate; ++state_idx) {
-            const weight_t A_val = A[state_idx * params.A_dstate_stride];
+            const weight_t A_val = params.scalar_dt ? A[0] : A[state_idx * params.A_dstate_stride];
             // Multiply the real part of A with LOG2E so we can use exp2f instead of expf.
             weight_t A_scaled;
             constexpr float kLog2e = M_LOG2E;
@@ -226,17 +233,18 @@ void selective_scan_bwd_kernel(SSMParamsBwd params) {
             }
             weight_t B_val, C_val;
             weight_t B_vals[kNItems], C_vals[kNItems];
+            int BC_head = dim_id / (params.dim / params.n_heads);
             if constexpr (!kIsVariableB) {
                 B_val = B[state_idx * params.B_dstate_stride];
             } else {
-                load_weight<Ktraits>(Bvar + state_idx * params.B_dstate_stride, B_vals,
+                load_weight<Ktraits>(Bvar + (BC_head * params.dstate + state_idx) * params.B_dstate_stride, B_vals,
                     smem_load_weight, (params.seqlen - chunk * kChunkSize) * (!kIsComplex ? 1 : 2));
             }
             if constexpr (!kIsVariableC) {
                 C_val = C[state_idx * params.C_dstate_stride];
             } else {
                 auto &smem_load_weight_C = !kIsVariableB ? smem_load_weight : smem_load_weight1;
-                load_weight<Ktraits>(Cvar + state_idx * params.C_dstate_stride, C_vals,
+                load_weight<Ktraits>(Cvar + (BC_head * params.dstate + state_idx) * params.C_dstate_stride, C_vals,
                     smem_load_weight_C, (params.seqlen - chunk * kChunkSize) * (!kIsComplex ? 1 : 2));
             }
             // const weight_t A_val = smem_a[state_idx];
@@ -304,8 +312,11 @@ void selective_scan_bwd_kernel(SSMParamsBwd params) {
                         Ktraits::BlockExchangeT(smem_exchange_C).BlockedToStriped(dC_vals, dC_vals);
                     }
                     const int seqlen_remaining = params.seqlen - chunk * kChunkSize - threadIdx.x;
-                    weight_t *dB_cur = dB + state_idx * params.dB_dstate_stride + chunk * kChunkSize + threadIdx.x;
-                    weight_t *dC_cur = dC + state_idx * params.dC_dstate_stride + chunk * kChunkSize + threadIdx.x;
+                    weight_t *dB_cur = dB + (BC_head * params.dstate + state_idx) * params.dB_dstate_stride + chunk * kChunkSize + threadIdx.x;
+                    weight_t *dC_cur = dC + (BC_head * params.dstate + state_idx) * params.dC_dstate_stride + chunk * kChunkSize + threadIdx.x;
+                    // We have outer product of B and delta, which means different dim_ids of the same
+                    // time step would contribute to the current state_idx. That's why we have to use
+                    // gpuAtomicAdd because of conccurrent access from those other dim_ids. 
                     #pragma unroll
                     for (int i = 0; i < kNItems; ++i) {
                         if (i * kNThreads < seqlen_remaining) {
@@ -325,7 +336,9 @@ void selective_scan_bwd_kernel(SSMParamsBwd params) {
                     dA_val = Ktraits::BlockReduceFloatT(smem_reduce_float).Sum(dA_val);
                 }
                 if (threadIdx.x == 0) {
-                    smem_da[state_idx] = chunk == params.n_chunks - 1 ? dA_val : dA_val + smem_da[state_idx];
+                    int state_idx_ = (params.scalar_dt) ? 0 : state_idx;
+                    bool first_time = (chunk == params.n_chunks - 1) && (!params.scalar_dt || (state_idx == 0));
+                    smem_da[state_idx_] = first_time ? dA_val : dA_val + smem_da[state_idx_];
                 }
             } else {
                 #pragma unroll
@@ -409,8 +422,8 @@ void selective_scan_bwd_kernel(SSMParamsBwd params) {
                         Ktraits::BlockExchangeT(smem_exchange_C).BlockedToStriped(dC_vals_f, dC_vals_f);
                     }
                     const int seqlen_remaining = (params.seqlen - chunk * kChunkSize) * 2 - threadIdx.x;
-                    float *dB_cur = reinterpret_cast<float *>(dB) + state_idx * params.dB_dstate_stride + chunk * kChunkSize * 2 + threadIdx.x;
-                    float *dC_cur = reinterpret_cast<float *>(dC) + state_idx * params.dC_dstate_stride + chunk * kChunkSize * 2 + threadIdx.x;
+                    float *dB_cur = reinterpret_cast<float *>(dB) + (BC_head * params.dstate + state_idx) * params.dB_dstate_stride + chunk * kChunkSize * 2 + threadIdx.x;
+                    float *dC_cur = reinterpret_cast<float *>(dC) + (BC_head * params.dstate + state_idx) * params.dC_dstate_stride + chunk * kChunkSize * 2 + threadIdx.x;
                     #pragma unroll
                     for (int i = 0; i < kNItems * 2; ++i) {
                         if (i * kNThreads < seqlen_remaining) {
@@ -431,7 +444,9 @@ void selective_scan_bwd_kernel(SSMParamsBwd params) {
                     dA_val = Ktraits::BlockReduceComplexT(smem_reduce_complex).Sum(dA_val);
                 }
                 if (threadIdx.x == 0) {
-                    smem_da[state_idx] = chunk == params.n_chunks - 1 ? dA_val : dA_val + smem_da[state_idx];
+                    int state_idx_ = (params.scalar_dt) ? 0 : state_idx;
+                    bool first_time = (chunk == params.n_chunks - 1) && (!params.scalar_dt || (state_idx == 0));
+                    smem_da[state_idx_] = first_time ? dA_val : dA_val + smem_da[state_idx_];
                 }
             }
         }
@@ -455,11 +470,32 @@ void selective_scan_bwd_kernel(SSMParamsBwd params) {
         input_t *du = reinterpret_cast<input_t *>(params.du_ptr) + batch_id * params.du_batch_stride
             + dim_id * params.du_d_stride + chunk * kChunkSize;
         input_t *ddelta = reinterpret_cast<input_t *>(params.ddelta_ptr) + batch_id * params.ddelta_batch_stride
-            + dim_id * params.ddelta_d_stride + chunk * kChunkSize;
+            + dim_group_id * params.ddelta_d_stride + chunk * kChunkSize;
         __syncthreads();
         store_output<Ktraits>(du, du_vals, smem_store, params.seqlen - chunk * kChunkSize);
-        __syncthreads();
-        store_output<Ktraits>(ddelta, ddelta_vals, smem_store, params.seqlen - chunk * kChunkSize);
+        if (!params.scalar_dt) {
+            __syncthreads();
+            store_output<Ktraits>(ddelta, ddelta_vals, smem_store, params.seqlen - chunk * kChunkSize);
+        } else {
+            // // different dim_ids get mapped to the same dim_group_id, and because of the 
+            // // conflict, we need to do an atomicAdd
+            // ddelta += threadIdx.x;
+
+            // // TODO: Not sure why the next line does not work!
+            // Ktraits::BlockExchangeT(smem_exchange).BlockedToStriped(ddelta_vals, ddelta_vals);
+            // const int seqlen_remaining = params.seqlen - chunk * kChunkSize - threadIdx.x;
+
+            // #pragma unroll
+            // for (int i = 0; i < kNItems; ++i) {
+            //     if (i * kNThreads < seqlen_remaining) {
+            //         gpuAtomicAdd(ddelta + i * kNThreads, ddelta_vals[i]); 
+            //     }
+            // }
+            #pragma unroll
+            for (int i = 0; i < kNItems; ++i)
+                if (chunk * kChunkSize + threadIdx.x * kNItems + i < params.seqlen)
+                    gpuAtomicAdd(ddelta + threadIdx.x * kNItems + i, ddelta_vals[i]);
+        }
 
         Bvar -= kChunkSize * (!kIsComplex ? 1 : 2);
         Cvar -= kChunkSize * (!kIsComplex ? 1 : 2);
@@ -474,7 +510,8 @@ void selective_scan_bwd_kernel(SSMParamsBwd params) {
         if (threadIdx.x == 0) { gpuAtomicAdd(ddelta_bias, ddelta_bias_val); }
     }
     for (int state_idx = threadIdx.x; state_idx < params.dstate; state_idx += blockDim.x) {
-        gpuAtomicAdd(&(dA[state_idx * params.dA_dstate_stride]), smem_da[state_idx]);
+        if (!params.scalar_dt)
+            gpuAtomicAdd(&(dA[state_idx * params.dA_dstate_stride]), smem_da[state_idx]);
         weight_t dBC_val;
         if (!kIsVariableB || !kIsVariableC) { dBC_val = smem_dbc[state_idx]; }
         if constexpr (!kIsVariableB) {
@@ -486,6 +523,9 @@ void selective_scan_bwd_kernel(SSMParamsBwd params) {
                         !kIsVariableB ? dBC_val * conj(B[state_idx * params.B_dstate_stride]) : dBC_val);
         }
     }
+
+    if (params.scalar_dt && threadIdx.x == 0)
+        gpuAtomicAdd(&(dA[0]), smem_da[0]);
 }
 
 template<int kNThreads, int kNItems, typename input_t, typename weight_t>
