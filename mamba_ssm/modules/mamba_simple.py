@@ -93,7 +93,6 @@ class Mamba(nn.Module):
         assert self.d_inner % self.n_heads == 0
         assert self.d_state % self.n_heads == 0
 
-        # TODO: check that dimensions are a multiple of
         self.head_d_inner = self.d_inner // self.n_heads
         self.head_dt_rank = max(1, self.dt_rank // self.n_heads)
         if self.scalar_dt:
@@ -163,7 +162,7 @@ class Mamba(nn.Module):
         else:
             self.out_proj = nn.Linear(self.head_d_inner, self.d_model, bias=bias, **factory_kwargs)
 
-    def forward(self, hidden_states, inference_params=None):
+    def forward(self, hidden_states, in_state: Optional[Tensor] = None, inference_params=None):
         """
         hidden_states: (B, L, D)
         Returns: same shape as hidden_states
@@ -190,8 +189,9 @@ class Mamba(nn.Module):
         A = -torch.exp(self.A_log.float())  # (d_inner, head_d_state)
         # In the backward pass we write dx and dz next to each other to avoid torch.cat
         if self.use_fast_path and causal_conv1d_fn is not None and inference_params is None:  # Doesn't support outputting the states
-            out = mamba_inner_fn(
+            out, out_state = mamba_inner_fn(
                 xz,
+                in_state,
                 self.conv1d.weight,
                 self.conv1d.bias,
                 self.x_proj.weight,
@@ -263,6 +263,7 @@ class Mamba(nn.Module):
             # subsequent functions
             y = selective_scan_fn(
                 x if (self.convolved_v) else pre_conv_x,  # bdl
+                in_state,
                 dt,
                 A,
                 B,
@@ -276,9 +277,11 @@ class Mamba(nn.Module):
                 n_heads=self.n_heads,
                 scalar_dt=self.scalar_dt and not self.dense_matrices
             )
+
+            # if ssm_state is not None:   # from now on, we always return the last_state!
+            y, out_state = y
             if ssm_state is not None:
-                y, last_state = y
-                ssm_state.copy_(last_state)
+                ssm_state.copy_(out_state)  # write over last_state into the cache
             if not self.multi_head_proj:
                 y = rearrange(y, "b d l -> b l d")
                 out = self.out_proj(y)
@@ -289,7 +292,7 @@ class Mamba(nn.Module):
                     "(b l) h d -> b l (h d)", l=seqlen)
                 if self.out_proj.bias is not None:
                     out = out + self.out_proj.bias
-        return out
+        return out, out_state
 
     def step(self, hidden_states, conv_state, ssm_state):
         dtype = hidden_states.dtype
@@ -446,7 +449,7 @@ class Block(nn.Module):
             ), "Only LayerNorm and RMSNorm are supported for fused_add_norm"
 
     def forward(
-        self, hidden_states: Tensor, residual: Optional[Tensor] = None, inference_params=None
+        self, hidden_states: Tensor, residual: Optional[Tensor] = None, in_state: Optional[Tensor] = None, inference_params=None
     ):
         r"""Pass the input through the encoder layer.
 
@@ -470,8 +473,8 @@ class Block(nn.Module):
                 residual_in_fp32=self.residual_in_fp32,
                 eps=self.norm.eps,
             )
-        hidden_states = self.mixer(hidden_states, inference_params=inference_params)
-        return hidden_states, residual
+        hidden_states, out_state = self.mixer(hidden_states, in_state, inference_params=inference_params)
+        return hidden_states, residual, out_state
 
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
         return self.mixer.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype, **kwargs)

@@ -11,7 +11,7 @@ class MambaConfig:
         'convolved_v': True,
         'n_heads': 1,
         'd_state': 16,
-        'dt_rank': 16,
+        'dt_rank': 16,    # set dt_rank=1 if scalar_dt is True
         'scalar_dt': False,
         'dense_matrices': True,
         'complementary_b': False,

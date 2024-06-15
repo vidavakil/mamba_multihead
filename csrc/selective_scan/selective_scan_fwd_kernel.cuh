@@ -96,21 +96,19 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
 
     const int batch_id = blockIdx.x;
     const int dim_id = blockIdx.y;
-    const int group_id = dim_id / (params.dim_ngroups_ratio); // Vida: this seems to be wrong! Has to be dim_id * kNRows / params.dim_ngroups_ratio, but it works if kNRows=1
+    const int group_id = dim_id / (params.dim_ngroups_ratio); // This seems to be wrong! Has to be dim_id * kNRows / params.dim_ngroups_ratio, but it works if kNRows=1
 
     if (params.scalar_dt)
         assert(kNRows == 1);
-    // TODO: Vida: dim_group_id should be the same as group_id, and B and C should also use group_id
-    // instead of your new logic. In Mamba_innerfn, utilize the Group dimension of B and C for handling
-    // block-diagonal operations on B and C, and also add a G dimension to A and delta and delta_bias
-    // for the same reason!
-    const int dim_group_id = floor(dim_id * kNRows / (params.scalar_dt ? (params.dim / params.n_heads) : 1));
 
-    // if (threadIdx.x == 0 && batch_id == 0 && dim_id % 20 == 0)
-    //     printf("dim_id: %d, dim_group_id: %d\n", dim_id, dim_group_id);
+    // TODO: dim_group_id is similar to group_id, and perhaps B and C should use group_id
+    // instead of dim_group_id.
+    const int dim_group_id = floor(dim_id * kNRows / (params.scalar_dt ? (params.dim / params.n_heads) : 1));
+    const bool kHasInH = params.in_h_ptr != nullptr;
 
     input_t *u = reinterpret_cast<input_t *>(params.u_ptr) + batch_id * params.u_batch_stride
         + dim_id * kNRows * params.u_d_stride;
+    weight_t *InH = kHasInH ? reinterpret_cast<weight_t *>(params.in_h_ptr) + (batch_id * params.dim + dim_id * kNRows) * params.dstate : nullptr;
     input_t *delta = reinterpret_cast<input_t *>(params.delta_ptr) + batch_id * params.delta_batch_stride
         + dim_group_id * params.delta_d_stride;
     weight_t *A = reinterpret_cast<weight_t *>(params.A_ptr) + dim_group_id * params.A_d_stride;
@@ -245,6 +243,18 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
                                 thread_data[i] = make_float4(1.f, 0.f, 0.f, 0.f);
                             }
                         }
+                    }
+                }
+                // Incorporate the incoming initial state, InH
+                if (threadIdx.x == 0 && chunk == 0 && kHasInH) {
+                    if constexpr (!kIsComplex) {
+                        thread_data[0].y += thread_data[0].x * InH[state_idx];
+                        thread_data[0].x = 0.f;
+                    } else {
+                        complex_t a = complex_t(thread_data[0].x, thread_data[0].y);
+                        complex_t b = complex_t(thread_data[0].z, thread_data[0].w);
+                        b += a * InH[state_idx];
+                        thread_data[0] = make_float4(0.f, 0.f, b.real_, b.imag_);
                     }
                 }
                 // Initialize running total

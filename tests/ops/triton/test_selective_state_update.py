@@ -10,7 +10,7 @@ from einops import rearrange
 
 from mamba_ssm.ops.triton.selective_state_update import selective_state_update, selective_state_update_ref
 
-# TODO: Vida For now, selective_state_update always works with dense A/dt/dt_bias, and thus dt_scalar is not passed in
+# TODO: For now, selective_state_update always works with dense A/dt/dt_bias, and thus dt_scalar is not passed in
 
 # TODO: Why complex weights are not tested?
 

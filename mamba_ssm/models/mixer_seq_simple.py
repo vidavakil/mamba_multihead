@@ -1,8 +1,5 @@
 # Copyright (c) 2023, Albert Gu, Tri Dao.
 
-# Copyright (c) 2024, Vida Vakilotojar.
-# Adds support for multi-head SSM.
-
 import math
 from functools import partial
 import json
@@ -107,6 +104,7 @@ class MixerModel(nn.Module):
         self.residual_in_fp32 = residual_in_fp32
 
         self.embedding = nn.Embedding(vocab_size, d_model, **factory_kwargs)
+        self.n_layer = n_layer
 
         # We change the order of residual and layer norm:
         # Instead of LN -> Attn / MLP -> Add, we do:
@@ -156,9 +154,10 @@ class MixerModel(nn.Module):
         hidden_states = self.embedding(input_ids)
         residual = None
         for layer in self.layers:
-            hidden_states, residual = layer(
-                hidden_states, residual, inference_params=inference_params
+            hidden_states, residual, _ = layer(
+                hidden_states, residual, None, inference_params=inference_params
             )
+
         if not self.fused_add_norm:
             residual = (hidden_states + residual) if residual is not None else hidden_states
             hidden_states = self.norm_f(residual.to(dtype=self.norm_f.weight.dtype))
@@ -175,7 +174,6 @@ class MixerModel(nn.Module):
                 residual_in_fp32=self.residual_in_fp32,
             )
         return hidden_states
-
 
 class MambaLMHeadModel(nn.Module, GenerationMixin):
 

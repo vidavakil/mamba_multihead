@@ -112,14 +112,19 @@ void selective_scan_bwd_kernel(SSMParamsBwd params) {
     const int dim_id = blockIdx.y;
     const int group_id = dim_id / (params.dim_ngroups_ratio);
 
-    // TODO: Vida: dim_group_id should be the same as group_id, and B and C should also use group_id
-    // instead of your new logic. In Mamba_innerfn, utilize the Group dimension of B and C for handling
-    // block-diagonal operations on B and C, and also add a G dimension to A and delta and delta_bias
-    // for the same reason!
+    const bool kHasInH =  params.in_h_ptr != nullptr;
+    const bool kHasdOutH = params.dout_h_ptr != nullptr;
+    const bool kHasdInH = params.din_h_ptr != nullptr;
+
+    // TODO: dim_group_id is similar to group_id, and perhaps B and C should use group_id
+    // instead of dim_group_id.
     const int dim_group_id = dim_id / (params.scalar_dt ? (params.dim / params.n_heads) : 1);
 
     input_t *u = reinterpret_cast<input_t *>(params.u_ptr) + batch_id * params.u_batch_stride
         + dim_id * params.u_d_stride;
+    weight_t *InH = kHasInH ? reinterpret_cast<weight_t *>(params.in_h_ptr) + (batch_id * params.dim + dim_id) * params.dstate : nullptr;
+    weight_t *dInH = kHasdInH ?  reinterpret_cast<weight_t *>(params.din_h_ptr) + (batch_id * params.dim + dim_id) * params.dstate : nullptr;
+    weight_t *dOutH = kHasdOutH ? reinterpret_cast<weight_t *>(params.dout_h_ptr) + (batch_id * params.dim + dim_id) * params.dstate : nullptr;
     input_t *delta = reinterpret_cast<input_t *>(params.delta_ptr) + batch_id * params.delta_batch_stride
         + dim_group_id * params.delta_d_stride;
     input_t *dout = reinterpret_cast<input_t *>(params.dout_ptr) + batch_id * params.dout_batch_stride
@@ -254,6 +259,8 @@ void selective_scan_bwd_kernel(SSMParamsBwd params) {
                 for (int i = 0; i < kNItems; ++i) {
                     const float delta_a_exp = exp2f(delta_vals[i] * A_scaled);
                     thread_data[i] = make_float2(delta_a_exp, !kIsVariableB ? delta_vals[i] * float(u_vals[i]) : delta_vals[i] * float(u_vals[i]) * B_vals[i]);
+                    // VIP Note: unlike the fwd kernel that took care of kIsEvenLen, this bwd kernel does not, which can cause problems!
+                    // The assumption must be that during training, we must always use seqlens that are a multiple of kNThreads * kNItems
                     if (i == 0) {
                         smem_delta_a[threadIdx.x == 0 ? state_idx + (chunk % 2) * MAX_DSTATE : threadIdx.x + 2 * MAX_DSTATE] = delta_a_exp;
                     } else {
@@ -264,10 +271,21 @@ void selective_scan_bwd_kernel(SSMParamsBwd params) {
                          ? (!kIsVariableB ? B_val * C_val : C_val)
                          : (!kIsVariableB ? B_val * C_vals[i] : C_vals[i]));
                 }
+                // Incorporate the incoming initial state, InH
+                if (threadIdx.x == 0 && chunk == 0 && kHasInH) {
+                    thread_data[0].y += thread_data[0].x * InH[state_idx];
+                    thread_data[0].x = 0.f;
+                }
                 __syncthreads();
                 thread_reverse_data[kNItems - 1].x = threadIdx.x == kNThreads - 1
                     ? (chunk == params.n_chunks - 1 ? 1.f : smem_delta_a[state_idx + ((chunk + 1) % 2) * MAX_DSTATE])
                     : smem_delta_a[threadIdx.x + 1 + 2 * MAX_DSTATE];
+
+                // Incorporate the incoming gradient of the last state, dOutH
+                if (threadIdx.x == kNThreads - 1 && chunk == params.n_chunks - 1 && kHasdOutH) {
+                    thread_reverse_data[kNItems - 1].y += dOutH[state_idx];
+                    thread_reverse_data[kNItems - 1].x = 0.f;
+                }
                 // Initialize running total
                 scan_t running_prefix = chunk > 0 && threadIdx.x % 32 == 0 ? x[(chunk - 1) * params.dstate + state_idx] : make_float2(1.f, 0.f);
                 SSMScanPrefixCallbackOp<weight_t> prefix_op(running_prefix);
@@ -340,7 +358,13 @@ void selective_scan_bwd_kernel(SSMParamsBwd params) {
                     bool first_time = (chunk == params.n_chunks - 1) && (!params.scalar_dt || (state_idx == 0));
                     smem_da[state_idx_] = first_time ? dA_val : dA_val + smem_da[state_idx_];
                 }
-            } else {
+                // Write out the gradient for the incoming initial state, dInH
+                if (kHasdInH && chunk == 0 && threadIdx.x == 0) {
+                    const float delta_a_exp = exp2f(delta_vals[0] * A_scaled);
+                    dInH[state_idx] = thread_reverse_data[0].y * delta_a_exp;
+                }
+            }
+            else {
                 #pragma unroll
                 for (int i = 0; i < kNItems; ++i) {
                     // Pytorch's implementation of complex exp (which calls thrust) is very slow
@@ -360,12 +384,22 @@ void selective_scan_bwd_kernel(SSMParamsBwd params) {
                     thread_reverse_data[i].z = dout_BC.real_;
                     thread_reverse_data[i].w = dout_BC.imag_;
                 }
+                // Incorporate the incoming initial state, InH
+                if (threadIdx.x == 0 && chunk == 0 && kHasInH) {
+                    const weight_t t_d = complex_t(thread_data[0].z, thread_data[0].w) + complex_t(thread_data[0].x, thread_data[0].y) * InH[state_idx];
+                    thread_data[0] = make_float4(0.f, 0.f, t_d.real_, t_d.imag_);
+                }
                 __syncthreads();
                 complex_t delta_a_exp = threadIdx.x == kNThreads - 1
                     ? (chunk == params.n_chunks - 1 ? 1.f : smem_delta_a[state_idx + ((chunk + 1) % 2) * MAX_DSTATE])
                     : smem_delta_a[threadIdx.x + 1 + 2 * MAX_DSTATE];
                 thread_reverse_data[kNItems - 1].x = delta_a_exp.real_;
                 thread_reverse_data[kNItems - 1].y = -delta_a_exp.imag_;
+                // Incorporate the incoming gradient of the last state, dOutH
+                if (threadIdx.x == kNThreads - 1 && chunk == params.n_chunks - 1 && kHasdOutH) {
+                    const weight_t t_d = complex_t(thread_data[kNItems - 1].z, thread_data[kNItems - 1].w) + dOutH[state_idx];
+                    thread_reverse_data[kNItems - 1] = make_float4(0.f, 0.f, t_d.real_, t_d.imag_);
+                }
                 // Initialize running total
                 scan_t running_prefix = chunk > 0 && threadIdx.x % 32 == 0 ? x[(chunk - 1) * params.dstate + state_idx] : make_float4(1.f, 0.f, 0.f, 0.f);
                 SSMScanPrefixCallbackOp<weight_t> prefix_op(running_prefix);
@@ -448,6 +482,11 @@ void selective_scan_bwd_kernel(SSMParamsBwd params) {
                     bool first_time = (chunk == params.n_chunks - 1) && (!params.scalar_dt || (state_idx == 0));
                     smem_da[state_idx_] = first_time ? dA_val : dA_val + smem_da[state_idx_];
                 }
+                // Write out the gradient for the incoming initial state, dInH
+                if (kHasdInH && chunk == 0 && threadIdx.x == 0) {
+                    complex_t delta_a_exp = cexp2f(delta_vals[0] * A_scaled);
+                    dInH[state_idx] = complex_t(thread_reverse_data[0].z, thread_reverse_data[0].w) * conj(delta_a_exp);
+                }
             }
         }
 
@@ -477,20 +516,6 @@ void selective_scan_bwd_kernel(SSMParamsBwd params) {
             __syncthreads();
             store_output<Ktraits>(ddelta, ddelta_vals, smem_store, params.seqlen - chunk * kChunkSize);
         } else {
-            // // different dim_ids get mapped to the same dim_group_id, and because of the 
-            // // conflict, we need to do an atomicAdd
-            // ddelta += threadIdx.x;
-
-            // // TODO: Not sure why the next line does not work!
-            // Ktraits::BlockExchangeT(smem_exchange).BlockedToStriped(ddelta_vals, ddelta_vals);
-            // const int seqlen_remaining = params.seqlen - chunk * kChunkSize - threadIdx.x;
-
-            // #pragma unroll
-            // for (int i = 0; i < kNItems; ++i) {
-            //     if (i * kNThreads < seqlen_remaining) {
-            //         gpuAtomicAdd(ddelta + i * kNThreads, ddelta_vals[i]); 
-            //     }
-            // }
             #pragma unroll
             for (int i = 0; i < kNItems; ++i)
                 if (chunk * kChunkSize + threadIdx.x * kNItems + i < params.seqlen)

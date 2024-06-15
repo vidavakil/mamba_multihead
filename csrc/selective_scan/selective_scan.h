@@ -62,6 +62,7 @@ struct SSMParamsBase {
     void *__restrict__ C_ptr;
     void *__restrict__ D_ptr;
     void *__restrict__ u_ptr;
+    void *__restrict__ in_h_ptr;
     void *__restrict__ delta_ptr;
     void *__restrict__ delta_bias_ptr;
     void *__restrict__ out_ptr;
@@ -92,11 +93,13 @@ struct SSMParamsBwd: public SSMParamsBase {
 
     // Common data pointers.
     void *__restrict__ dout_ptr;
+    void *__restrict__ dout_h_ptr;
     void *__restrict__ dA_ptr;
     void *__restrict__ dB_ptr;
     void *__restrict__ dC_ptr;
     void *__restrict__ dD_ptr;
     void *__restrict__ du_ptr;
+    void *__restrict__ din_h_ptr;
     void *__restrict__ dz_ptr;
     void *__restrict__ ddelta_ptr;
     void *__restrict__ ddelta_bias_ptr;
